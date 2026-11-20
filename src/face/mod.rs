@@ -15,17 +15,20 @@ mod detector;
 mod embedder;
 mod landmarks;
 mod spoof;
+use crate::math::cosine_similarity;
 use detector::Detector;
 use embedder::Embedder;
-pub use landmarks::LandmarkDetector;
-pub use spoof::{SpoofAnalysis, SpoofDetector};
+use landmarks::LandmarkDetector;
+pub use spoof::SpoofAnalysis;
+use spoof::SpoofDetector;
 
 #[derive(Debug, Clone)]
 pub struct FaceConfig {
     pub detector_model: PathBuf,
     pub embedder_model: PathBuf,
     pub spoof_model: PathBuf,
-    pub landmark_model: PathBuf,
+    /// Required only by [`FaceEngine::analyze_liveness`].
+    pub landmark_model: Option<PathBuf>,
     pub model_version: String,
     pub detector_input_size: u32,
     pub detector_score_threshold: f32,
@@ -40,7 +43,6 @@ pub struct FaceConfig {
 pub struct Quality {
     pub passed: bool,
     pub score: f32,
-    pub face_count: usize,
     pub blur: f32,
     pub brightness: f32,
     pub reasons: Vec<String>,
@@ -49,6 +51,7 @@ pub struct Quality {
 #[derive(Debug, Clone)]
 pub struct FaceAnalysis {
     pub embedding: Vec<f32>,
+    /// Normalized `[x1, y1, x2, y2]` coordinates in the range 0..1.
     pub bbox: [f32; 4],
     pub quality: Quality,
     pub spoof: SpoofAnalysis,
@@ -64,6 +67,8 @@ pub enum FaceError {
     MultipleFaces(usize),
     #[error("low quality face")]
     LowQuality(Quality),
+    /// A caller-supplied byte stream could not be decoded. The engine itself
+    /// accepts already-decoded [`DynamicImage`] values.
     #[error("image decode failed: {0}")]
     Image(String),
     #[error("model error: {0}")]
@@ -78,7 +83,7 @@ pub struct FaceEngine {
     detector: Mutex<Detector>,
     embedder: Mutex<Embedder>,
     spoof: Mutex<SpoofDetector>,
-    landmark: Mutex<LandmarkDetector>,
+    landmark: Option<Mutex<LandmarkDetector>>,
 }
 
 // Shared across threads; fail the build if the sessions stop being thread-safe.
@@ -89,14 +94,18 @@ const _: fn() = || {
 
 impl FaceEngine {
     pub fn load(config: FaceConfig) -> Result<Self, FaceError> {
-        let environment = ort::init()
-            .with_name("vision-inference")
-            .build()
-            .map_err(|error| FaceError::Model(format!("failed to init ONNX Runtime: {error}")))?;
+        let environment =
+            crate::runtime::environment().map_err(|error| FaceError::Model(error.to_string()))?;
+        Self::load_with(config, environment)
+    }
+
+    /// Load with an existing ONNX Runtime environment. The caller must use the
+    /// single environment allowed per process.
+    pub fn load_with(config: FaceConfig, environment: &Environment) -> Result<Self, FaceError> {
         let (w, h) = (config.detector_input_size, config.detector_input_size);
         let detector = Detector::load(
             &config.detector_model,
-            &environment,
+            environment,
             (w, h),
             config.detector_score_threshold,
             config.detector_iou_threshold,
@@ -104,20 +113,24 @@ impl FaceEngine {
         .map_err(FaceError::Model)?;
 
         let embedder =
-            Embedder::load(&config.embedder_model, &environment).map_err(FaceError::Model)?;
+            Embedder::load(&config.embedder_model, environment).map_err(FaceError::Model)?;
 
         let spoof =
-            SpoofDetector::load(&config.spoof_model, &environment).map_err(FaceError::Model)?;
-        let landmark = LandmarkDetector::load(&config.landmark_model, &environment)
+            SpoofDetector::load(&config.spoof_model, environment).map_err(FaceError::Model)?;
+        let landmark = config
+            .landmark_model
+            .as_ref()
+            .map(|path| LandmarkDetector::load(path, environment))
+            .transpose()
             .map_err(FaceError::Model)?;
 
         Ok(Self {
             config,
-            _environment: environment,
+            _environment: environment.clone(),
             detector: Mutex::new(detector),
             embedder: Mutex::new(embedder),
             spoof: Mutex::new(spoof),
-            landmark: Mutex::new(landmark),
+            landmark: landmark.map(Mutex::new),
         })
     }
 
@@ -167,7 +180,7 @@ impl FaceEngine {
 
         let (brightness, blur) = face_stats(&rgb, &pixel_bbox);
 
-        let quality = evaluate_quality(&self.config, face.score, face_size, brightness, blur, 1);
+        let quality = evaluate_quality(&self.config, face.score, face_size, brightness, blur);
         if !quality.passed {
             return Err(FaceError::LowQuality(quality));
         }
@@ -180,8 +193,12 @@ impl FaceEngine {
             .map_err(FaceError::Inference)?;
 
         let ear = if with_ear {
+            let landmark = self
+                .landmark
+                .as_ref()
+                .ok_or_else(|| FaceError::Model("landmark model is not configured".into()))?;
             Some(
-                self.landmark
+                landmark
                     .lock()
                     .map_err(|_| FaceError::Inference("landmark lock poisoned".into()))?
                     .ear(&rgb, &pixel_bbox)
@@ -212,14 +229,7 @@ impl FaceEngine {
     }
 
     pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
-        if a.len() != b.len() {
-            return 0.0;
-        }
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| x * y)
-            .sum::<f32>()
-            .clamp(-1.0, 1.0)
+        cosine_similarity(a, b)
     }
 
     pub fn environment(&self) -> &Environment {
@@ -237,7 +247,6 @@ fn evaluate_quality(
     face_size: f64,
     brightness: f64,
     blur: f64,
-    face_count: usize,
 ) -> Quality {
     let min_size = f64::from(config.min_face_size);
     let mut reasons = Vec::new();
@@ -279,7 +288,6 @@ fn evaluate_quality(
     Quality {
         passed: reasons.is_empty(),
         score: score as f32,
-        face_count,
         blur: blur as f32,
         brightness: brightness as f32,
         reasons,
@@ -298,34 +306,45 @@ fn face_stats(rgb: &RgbImage, bbox: &[f32; 4]) -> (f64, f64) {
         return (0.0, 0.0);
     }
     let (w, h) = ((x2 - x1) as usize, (y2 - y1) as usize);
+    let luma_row = |y: u32| -> Vec<f64> {
+        (x1..x2)
+            .map(|x| {
+                let p = rgb.get_pixel(x, y);
+                0.299 * f64::from(p[0]) + 0.587 * f64::from(p[1]) + 0.114 * f64::from(p[2])
+            })
+            .collect()
+    };
 
-    let mut luma = Vec::with_capacity(w * h);
-    for y in y1..y2 {
-        for x in x1..x2 {
-            let p = rgb.get_pixel(x, y);
-            luma.push(0.299 * f64::from(p[0]) + 0.587 * f64::from(p[1]) + 0.114 * f64::from(p[2]));
-        }
+    let mut above = luma_row(y1);
+    let mut brightness = above.iter().sum::<f64>();
+    if h == 1 {
+        return (brightness / w as f64, 0.0);
     }
-    let brightness = luma.iter().sum::<f64>() / luma.len() as f64;
+    let mut current = luma_row(y1 + 1);
+    brightness += current.iter().sum::<f64>();
 
     if w < 3 || h < 3 {
-        return (brightness, 0.0);
+        return (brightness / (w * h) as f64, 0.0);
     }
+
     let mut sum = 0.0;
     let mut sum_sq = 0.0;
     let mut n = 0u64;
-    for y in 1..h - 1 {
+    for y in (y1 + 2)..y2 {
+        let below = luma_row(y);
+        brightness += below.iter().sum::<f64>();
         for x in 1..w - 1 {
-            let i = y * w + x;
-            let lap = luma[i - w] + luma[i + w] + luma[i - 1] + luma[i + 1] - 4.0 * luma[i];
+            let lap = above[x] + below[x] + current[x - 1] + current[x + 1] - 4.0 * current[x];
             sum += lap;
             sum_sq += lap * lap;
             n += 1;
         }
+        above = current;
+        current = below;
     }
     let mean = sum / n as f64;
     let variance = (sum_sq / n as f64 - mean * mean).max(0.0);
-    (brightness, variance)
+    (brightness / (w * h) as f64, variance)
 }
 
 #[cfg(test)]
@@ -337,7 +356,7 @@ mod tests {
             detector_model: PathBuf::from("det.onnx"),
             embedder_model: PathBuf::from("rec.onnx"),
             spoof_model: PathBuf::from("spoof.onnx"),
-            landmark_model: PathBuf::from("landmark.onnx"),
+            landmark_model: Some(PathBuf::from("landmark.onnx")),
             model_version: "test".into(),
             detector_input_size: 640,
             detector_score_threshold: 0.5,
@@ -367,7 +386,7 @@ mod tests {
 
     #[test]
     fn quality_accepts_good_face() {
-        let q = evaluate_quality(&config(), 0.95, 200.0, 128.0, 60.0, 1);
+        let q = evaluate_quality(&config(), 0.95, 200.0, 128.0, 60.0);
         assert!(q.passed);
         assert!(q.reasons.is_empty());
         assert!(q.score > 0.8);
@@ -375,12 +394,20 @@ mod tests {
 
     #[test]
     fn quality_collects_failure_reasons() {
-        let small_dark = evaluate_quality(&config(), 0.95, 50.0, 10.0, 60.0, 1);
+        let small_dark = evaluate_quality(&config(), 0.95, 50.0, 10.0, 60.0);
         assert!(!small_dark.passed);
         assert_eq!(small_dark.reasons, ["face_too_small", "too_dark"]);
 
-        let bright_blurry = evaluate_quality(&config(), 0.95, 200.0, 250.0, 5.0, 1);
+        let bright_blurry = evaluate_quality(&config(), 0.95, 200.0, 250.0, 5.0);
         assert!(!bright_blurry.passed);
         assert_eq!(bright_blurry.reasons, ["too_bright", "blurry"]);
+    }
+
+    #[test]
+    fn face_stats_handles_constant_face_without_a_full_plane() {
+        let image = RgbImage::from_pixel(20, 20, image::Rgb([100, 100, 100]));
+        let (brightness, blur) = face_stats(&image, &[0.0, 0.0, 19.0, 19.0]);
+        assert!((brightness - 100.0).abs() < 1e-6);
+        assert_eq!(blur, 0.0);
     }
 }

@@ -60,6 +60,13 @@ const _: fn() = || {
 };
 
 impl SceneEngine {
+    /// Load using the process-wide ONNX Runtime environment.
+    pub fn load_standalone(config: SceneConfig) -> Result<Self, SceneError> {
+        let environment =
+            crate::runtime::environment().map_err(|error| SceneError::Model(error.to_string()))?;
+        Self::load(config, environment)
+    }
+
     pub fn load(config: SceneConfig, environment: &Environment) -> Result<Self, SceneError> {
         let session = Session::builder(environment)
             .map_err(|error| SceneError::Model(format!("failed to create scene session: {error}")))?
@@ -119,7 +126,11 @@ impl SceneEngine {
                 embedding.len()
             )));
         }
-        normalize(&mut embedding)?;
+        if !crate::math::l2_normalize(&mut embedding) {
+            return Err(SceneError::Inference(
+                "DINOv2 produced a degenerate embedding".into(),
+            ));
+        }
         Ok(SceneAnalysis {
             embedding,
             model_version: self.config.model_version.clone(),
@@ -127,14 +138,7 @@ impl SceneEngine {
     }
 
     pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
-        if a.len() != b.len() {
-            return 0.0;
-        }
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| x * y)
-            .sum::<f32>()
-            .clamp(-1.0, 1.0)
+        crate::math::cosine_similarity(a, b)
     }
 
     pub fn threshold(&self) -> f32 {
@@ -146,8 +150,10 @@ impl SceneEngine {
     }
 }
 
-/// Resize the short side to 256 and center-crop 224. This preserves the
-/// aspect ratio instead of squashing 16:9 camera frames into a square.
+/// Center-crop the largest square, resize to 256, then center-crop 224.
+///
+/// Cropping the source before resizing keeps the intermediate buffer bounded:
+/// resizing a 6000x1 frame first would allocate a 1.5Mx256 buffer.
 fn preprocess(image: &DynamicImage, size: u32) -> Result<RgbImage, SceneError> {
     if size == 0 {
         return Err(SceneError::Image(
@@ -160,31 +166,17 @@ fn preprocess(image: &DynamicImage, size: u32) -> Result<RgbImage, SceneError> {
     }
     let short = width.min(height);
     let resized_short = size.saturating_mul(8) / 7;
-    let scale = resized_short as f32 / short as f32;
-    let resized_width = ((width as f32 * scale).round() as u32).max(size);
-    let resized_height = ((height as f32 * scale).round() as u32).max(size);
-    let resized = imageops::resize(
+    let square = imageops::crop_imm(
         &image.to_rgb8(),
-        resized_width,
-        resized_height,
-        FilterType::Lanczos3,
-    );
-    let left = (resized_width - size) / 2;
-    let top = (resized_height - size) / 2;
-    Ok(imageops::crop_imm(&resized, left, top, size, size).to_image())
-}
-
-fn normalize(vector: &mut [f32]) -> Result<(), SceneError> {
-    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if !norm.is_finite() || norm <= 1e-12 {
-        return Err(SceneError::Inference(
-            "DINOv2 produced a degenerate embedding".into(),
-        ));
-    }
-    for value in vector {
-        *value /= norm;
-    }
-    Ok(())
+        (width - short) / 2,
+        (height - short) / 2,
+        short,
+        short,
+    )
+    .to_image();
+    let resized = imageops::resize(&square, resized_short, resized_short, FilterType::Lanczos3);
+    let inset = (resized_short - size) / 2;
+    Ok(imageops::crop_imm(&resized, inset, inset, size, size).to_image())
 }
 
 #[cfg(test)]
@@ -192,26 +184,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_produces_unit_vector() {
-        let mut vector = [3.0, 4.0];
-        normalize(&mut vector).unwrap();
-        assert!((vector[0] - 0.6).abs() < 1e-6);
-        assert!((vector[1] - 0.8).abs() < 1e-6);
-    }
-
-    #[test]
-    fn normalize_rejects_zero_vector() {
-        assert!(normalize(&mut [0.0, 0.0]).is_err());
-    }
-
-    #[test]
     fn similarity_is_cosine_for_normalized_vectors() {
         assert!((SceneEngine::similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
         assert!(SceneEngine::similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
     }
+
     #[test]
     fn preprocess_preserves_aspect_ratio_and_output_size() {
         let image = DynamicImage::new_rgb8(320, 180);
+        let output = preprocess(&image, 224).unwrap();
+        assert_eq!(output.dimensions(), (224, 224));
+    }
+
+    #[test]
+    fn preprocess_handles_extreme_aspect_ratio() {
+        let image = DynamicImage::new_rgb8(6000, 1);
         let output = preprocess(&image, 224).unwrap();
         assert_eq!(output.dimensions(), (224, 224));
     }

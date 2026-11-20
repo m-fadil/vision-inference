@@ -16,14 +16,20 @@ API routing, and accept/reject policy belong to the caller.
 ## Requirements
 
 The crate does not bundle model assets. Supply each ONNX file path through
-`FaceConfig` or `SceneConfig`. The target environment must also provide the
-ONNX Runtime dynamic library; the crate uses `ort` with the `load-dynamic`
-feature, so set `ORT_DYLIB_PATH` to the library and depend on a compatible
-`ort` version (`2.0.0-rc.15`).
+`FaceConfig` or `SceneConfig`. The target environment must provide the ONNX
+Runtime dynamic library; the crate uses `ort` with the `load-dynamic` feature.
+Set `ORT_DYLIB_PATH` to the library, or keep `libonnxruntime` on the loader's
+search path.
+
+The first `FaceEngine::load` or `SceneEngine::load_standalone` creates one
+process-wide ONNX environment. Later loads reuse it. If you already own an
+environment, use `FaceEngine::load_with` or `SceneEngine::load(config, &env)`.
+`vision_inference::ort` is re-exported for custom setup.
 
 ```toml
 [dependencies]
-vision-inference = { path = "../vision-inference" }
+# Point at wherever you cloned this crate; it is not published on crates.io.
+vision-inference = { path = "/path/to/vision-inference" }
 image = "0.25"
 ```
 
@@ -41,7 +47,10 @@ Inference is synchronous and the engines serialize sessions behind mutexes.
 Async runtimes must call these methods from `spawn_blocking` (or an equivalent
 blocking pool) so ONNX work never occupies an async worker.
 
-```rust
+Paths in the example are relative to the process working directory; pass
+absolute paths if the working directory is not fixed.
+
+```rust,no_run
 use image::open;
 use vision_inference::face::{FaceConfig, FaceEngine};
 use vision_inference::scene::{SceneConfig, SceneEngine};
@@ -51,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         detector_model: "models/2.5g_bnkps.onnx".into(),
         embedder_model: "models/w600k_r50.onnx".into(),
         spoof_model: "models/minifasnet_v2_128.onnx".into(),
-        landmark_model: "models/pipnet_r18_68.onnx".into(),
+        landmark_model: Some("models/pipnet_r18_68.onnx".into()),
         model_version: "buffalo_l".into(),
         detector_input_size: 640,
         detector_score_threshold: 0.5,
@@ -67,15 +76,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(face.embedding.len(), 512);
     // Use faces.analyze_liveness(&image)? for an additional EAR value.
 
-    let scenes = SceneEngine::load(
-        SceneConfig {
-            model: "models/dinov2_vits14.onnx".into(),
-            model_version: "dinov2-small".into(),
-            input_size: 224,
-            threshold: 0.8,
-        },
-        &faces.environment(),
-    )?;
+    let scenes = SceneEngine::load_standalone(SceneConfig {
+        model: "models/dinov2_vits14.onnx".into(),
+        model_version: "dinov2-small".into(),
+        input_size: 224,
+        threshold: 0.8,
+    })?;
 
     let scene = scenes.analyze(&image)?;
     assert_eq!(scene.embedding.len(), 384);
@@ -96,5 +102,5 @@ Neither crate makes a business decision.
 
 ## License
 
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party
-attribution.
+Apache-2.0. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+for third-party attribution.

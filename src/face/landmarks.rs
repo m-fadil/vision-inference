@@ -64,9 +64,9 @@ impl LandmarkDetector {
             .run(ort::inputs![&self.input_name => value])
             .map_err(|error| format!("landmark inference failed: {error}"))?;
 
-        let cls = output_vec(&outputs, 0)?;
-        let offset_x = output_vec(&outputs, 1)?;
-        let offset_y = output_vec(&outputs, 2)?;
+        let cls = output_vec(&outputs, "cls_map")?;
+        let offset_x = output_vec(&outputs, "offset_x")?;
+        let offset_y = output_vec(&outputs, "offset_y")?;
         let expected = LANDMARKS * FEATURE_SIZE * FEATURE_SIZE;
         if cls.len() != expected || offset_x.len() != expected || offset_y.len() != expected {
             return Err(format!(
@@ -78,7 +78,7 @@ impl LandmarkDetector {
         }
 
         let mut points = [(0.0f32, 0.0f32); LANDMARKS];
-        for i in 0..LANDMARKS {
+        for (i, point) in points.iter_mut().enumerate() {
             let base = i * FEATURE_SIZE * FEATURE_SIZE;
             let mut best = 0;
             for j in 1..FEATURE_SIZE * FEATURE_SIZE {
@@ -91,7 +91,7 @@ impl LandmarkDetector {
             let x = (col + offset_x[base + best]) / (INPUT_SIZE as f32 / STRIDE);
             let y = (row + offset_y[base + best]) / (INPUT_SIZE as f32 / STRIDE);
             // Map normalized crop coordinates back to the original image.
-            points[i] = (
+            *point = (
                 x * crop_width as f32 + x1 as f32,
                 y * crop_height as f32 + y1 as f32,
             );
@@ -106,11 +106,10 @@ impl LandmarkDetector {
     }
 }
 
-fn output_vec(
-    outputs: &ort::session::SessionOutputs<'_>,
-    index: usize,
-) -> Result<Vec<f32>, String> {
-    outputs[index]
+fn output_vec(outputs: &ort::session::SessionOutputs<'_>, name: &str) -> Result<Vec<f32>, String> {
+    outputs
+        .get(name)
+        .ok_or_else(|| format!("landmark model has no `{name}` output"))?
         .try_extract_array::<f32>()
         .map(|array| array.iter().copied().collect())
         .map_err(|error| error.to_string())
@@ -123,7 +122,7 @@ fn crop_face(image: &RgbImage, bbox: &[f32; 4]) -> (RgbImage, u32, u32, u32, u32
     let pad_y = height * 0.1;
 
     let x1 = (bbox[0] - pad_x).floor().max(0.0) as u32;
-    let y1 = (bbox[1] + pad_y).floor().max(0.0) as u32;
+    let y1 = (bbox[1] - pad_y).floor().max(0.0) as u32;
     let x2 = (bbox[2] + pad_x).ceil().min(image.width() as f32) as u32;
     let y2 = (bbox[3] + pad_y).ceil().min(image.height() as f32) as u32;
     let crop_width = (x2.saturating_sub(x1)).max(1);
@@ -181,5 +180,13 @@ mod tests {
             (1.0, 0.0),
         ];
         assert!(eye_ratio(&points) < 1e-6);
+    }
+
+    #[test]
+    fn crop_face_pads_equally_on_both_axes() {
+        let image = RgbImage::new(200, 200);
+        let (_, width, height, x1, y1) = crop_face(&image, &[10.0, 10.0, 110.0, 110.0]);
+        assert_eq!((x1, y1), (0, 0));
+        assert_eq!(width, height);
     }
 }

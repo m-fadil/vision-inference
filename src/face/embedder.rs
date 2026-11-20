@@ -71,37 +71,9 @@ impl Embedder {
                 embedding.len()
             ));
         }
-        normalize(&mut embedding)?;
+        if !crate::math::l2_normalize(&mut embedding) {
+            return Err("ArcFace produced a degenerate embedding".to_string());
+        }
         Ok(embedding)
-    }
-}
-
-fn normalize(vector: &mut [f32]) -> Result<(), String> {
-    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if !norm.is_finite() || norm <= 1e-12 {
-        return Err("ArcFace produced a degenerate embedding".to_string());
-    }
-    for value in vector {
-        *value /= norm;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_produces_unit_vector() {
-        let mut vector = [3.0, 4.0];
-        normalize(&mut vector).unwrap();
-        assert!((vector[0] - 0.6).abs() < 1e-6);
-        assert!((vector[1] - 0.8).abs() < 1e-6);
-        assert!((vector.iter().map(|value| value * value).sum::<f32>() - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn normalize_rejects_zero_vector() {
-        assert!(normalize(&mut [0.0, 0.0]).is_err());
     }
 }

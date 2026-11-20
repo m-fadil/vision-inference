@@ -19,6 +19,10 @@ use std::path::Path;
 
 const INPUT_SIZE: u32 = 128;
 const CROP_MARGIN: f32 = 1.5;
+// The model consumes 128x128. Sampling a larger crop only adds memory and
+// work, so bound the intermediate at 512x512.
+// shortcut: fixed 512px sampling cap; raise if a larger model input is used.
+const MAX_SAMPLE_SIDE: i32 = 512;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct SpoofAnalysis {
@@ -102,17 +106,20 @@ fn crop_square(image: &RgbImage, bbox: &[f32; 4]) -> RgbImage {
     let box_height = (bbox[3] - bbox[1]).max(1.0);
     let side = (box_width.max(box_height) * CROP_MARGIN).round() as i32;
     let side = side.max(1);
+    let sample_side = side.min(MAX_SAMPLE_SIDE);
 
     let center_x = bbox[0] + box_width * 0.5;
     let center_y = bbox[1] + box_height * 0.5;
     let left = (center_x - side as f32 * 0.5).round() as i32;
     let top = (center_y - side as f32 * 0.5).round() as i32;
 
-    let mut crop = RgbImage::new(side as u32, side as u32);
-    for y in 0..side {
-        for x in 0..side {
-            let source_x = reflect(left + x, image.width());
-            let source_y = reflect(top + y, image.height());
+    let mut crop = RgbImage::new(sample_side as u32, sample_side as u32);
+    for y in 0..sample_side {
+        for x in 0..sample_side {
+            let source_x = left + x * side / sample_side;
+            let source_y = top + y * side / sample_side;
+            let source_x = reflect(source_x, image.width());
+            let source_y = reflect(source_y, image.height());
             crop.put_pixel(x as u32, y as u32, *image.get_pixel(source_x, source_y));
         }
     }
