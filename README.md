@@ -28,10 +28,13 @@ environment, use `FaceEngine::load_with` or `SceneEngine::load(config, &env)`.
 
 ```toml
 [dependencies]
-# Point at wherever you cloned this crate; it is not published on crates.io.
-vision-inference = { path = "/path/to/vision-inference" }
+# Not published on crates.io: use a git tag, or a local checkout while developing.
+vision-inference = { git = "https://github.com/m-fadil/vision-inference.git", tag = "v0.1.0" }
+# vision-inference = { path = "/path/to/vision-inference" }
 image = "0.25"
 ```
+
+Replace `tag` with `rev = "<sha>"` if you need an immutable pin.
 
 ```bash
 export ORT_DYLIB_PATH=/absolute/path/to/libonnxruntime.so
