@@ -2,5 +2,11 @@
 name = "vision-inference"
 version = "0.1.0"
 edition = "2024"
+description = "Face and scene inference primitives backed by ONNX Runtime"
 
 [dependencies]
+image = "0.25"
+ndarray = "0.17"
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["ndarray", "load-dynamic"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
