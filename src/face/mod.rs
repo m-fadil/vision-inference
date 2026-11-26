@@ -48,14 +48,33 @@ pub struct Quality {
     pub reasons: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Ear {
+    pub left: f32,
+    pub right: f32,
+}
+
+impl Ear {
+    pub fn mean(self) -> f32 {
+        (self.left + self.right) * 0.5
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FaceAnalysis {
     pub embedding: Vec<f32>,
     /// Normalized `[x1, y1, x2, y2]` coordinates in the range 0..1.
     pub bbox: [f32; 4],
+    /// YuNet keypoints normalized to the image: image-left eye, image-right
+    /// eye, nose, image-left mouth corner, image-right mouth corner.
+    pub keypoints: [(f32, f32); 5],
+    /// Shorter side of the face bbox relative to the shorter image side.
+    pub face_ratio: f32,
+    /// Image width / height, used to undo normalized-coordinate skew in angles.
+    pub image_aspect: f32,
     pub quality: Quality,
     pub spoof: SpoofAnalysis,
-    pub ear: Option<f32>,
+    pub ear: Option<Ear>,
     pub model_version: String,
 }
 
@@ -102,11 +121,10 @@ impl FaceEngine {
     /// Load with an existing ONNX Runtime environment. The caller must use the
     /// single environment allowed per process.
     pub fn load_with(config: FaceConfig, environment: &Environment) -> Result<Self, FaceError> {
-        let (w, h) = (config.detector_input_size, config.detector_input_size);
         let detector = Detector::load(
             &config.detector_model,
             environment,
-            (w, h),
+            config.detector_input_size,
             config.detector_score_threshold,
             config.detector_iou_threshold,
         )
@@ -177,6 +195,16 @@ impl FaceEngine {
                 .min(pixel_bbox[3] - pixel_bbox[1])
                 .max(0.0),
         );
+        let image_min = width.min(height) as f32;
+        let face_ratio = if image_min > 0.0 {
+            face_size as f32 / image_min
+        } else {
+            0.0
+        };
+        let image_aspect = width as f32 / height as f32;
+        let keypoints = face
+            .landmarks
+            .map(|(x, y)| (x / width as f32, y / height as f32));
 
         let (brightness, blur) = face_stats(&rgb, &pixel_bbox);
 
@@ -197,13 +225,12 @@ impl FaceEngine {
                 .landmark
                 .as_ref()
                 .ok_or_else(|| FaceError::Model("landmark model is not configured".into()))?;
-            Some(
-                landmark
-                    .lock()
-                    .map_err(|_| FaceError::Inference("landmark lock poisoned".into()))?
-                    .ear(&rgb, &pixel_bbox)
-                    .map_err(FaceError::Inference)?,
-            )
+            let (left, right) = landmark
+                .lock()
+                .map_err(|_| FaceError::Inference("landmark lock poisoned".into()))?
+                .ear(&rgb, &pixel_bbox)
+                .map_err(FaceError::Inference)?;
+            Some(Ear { left, right })
         } else {
             None
         };
@@ -221,6 +248,9 @@ impl FaceEngine {
         Ok(FaceAnalysis {
             embedding,
             bbox,
+            keypoints,
+            face_ratio,
+            image_aspect,
             quality,
             spoof,
             ear,

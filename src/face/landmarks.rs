@@ -47,7 +47,7 @@ impl LandmarkDetector {
         })
     }
 
-    pub fn ear(&mut self, image: &RgbImage, bbox: &[f32; 4]) -> Result<f32, String> {
+    pub fn ear(&mut self, image: &RgbImage, bbox: &[f32; 4]) -> Result<(f32, f32), String> {
         let (crop, crop_width, crop_height, x1, y1) = crop_face(image, bbox);
         let resized = imageops::resize(&crop, INPUT_SIZE, INPUT_SIZE, FilterType::Lanczos3);
 
@@ -102,7 +102,7 @@ impl LandmarkDetector {
         if !left.is_finite() || !right.is_finite() {
             return Err("landmark EAR is not finite".to_string());
         }
-        Ok((left + right) * 0.5)
+        Ok((left, right))
     }
 }
 

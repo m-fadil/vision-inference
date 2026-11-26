@@ -1,12 +1,21 @@
 # Third-party notices
 
-## face_id-rs
+## YuNet face detector
 
-The SCRFD and ArcFace inference pipeline in `src/face/detector.rs`,
-`src/face/embedder.rs`, and `src/face/align.rs` is an internal reimplementation
-informed by the public algorithms and tensor layouts in
-[`RuurdBijlsma/face_id-rs`](https://github.com/RuurdBijlsma/face_id-rs)
-(Apache License 2.0). The `face_id` crate is no longer linked or vendored.
+`face_detection_yunet_2026may.onnx` is the YuNet detector from
+[`opencv/opencv_zoo`](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet).
+The model files in that directory are MIT-licensed. The detector
+post-processing in `src/face/detector.rs` follows OpenCV's public YuNet decode.
+
+MIT License: <https://opensource.org/license/mit>
+
+## AuraFace face embedder
+
+`glintr100.onnx` is the AuraFace v1 ArcFace ResNet100 embedder from
+[`fal/AuraFace-v1`](https://huggingface.co/fal/AuraFace-v1) (Apache License 2.0).
+The model card states that it was trained on commercially available data for
+commercial use. The repository also contains an InsightFace SCRFD file; this
+crate does not use that file.
 
 Apache License 2.0: <https://www.apache.org/licenses/LICENSE-2.0>
 

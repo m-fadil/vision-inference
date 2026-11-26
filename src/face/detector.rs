@@ -1,9 +1,11 @@
-//! SCRFD face detector (640x640, three stride levels).
+//! YuNet face detector (three stride levels, dynamic input).
 //!
-//! This is the minimum inference path needed by `FaceEngine`: letterbox the
-//! image, run the ONNX graph, decode score/bbox/keypoint tensors, and apply
-//! class-agnostic NMS. The configured model must expose
-//! `score_{8,16,32}`, `bbox_{8,16,32}`, and `kps_{8,16,32}` outputs.
+//! The model consumes a BGR image, padded to a multiple of 32, and exposes
+//! `cls_{8,16,32}`, `obj_{8,16,32}`, `bbox_{8,16,32}`, and `kps_{8,16,32}`.
+//! Scores are `sqrt(cls * obj)`. Boxes and landmarks are decoded relative to
+//! each grid cell. YuNet names the eyes/mouth corners from the subject's side;
+//! in image coordinates they run left-to-right, which is the ArcFace template
+//! order used by `align.rs`.
 
 use image::{RgbImage, imageops};
 use ndarray::Array4;
@@ -15,11 +17,14 @@ use ort::value::Value;
 use std::path::Path;
 
 const STRIDES: [usize; 3] = [8, 16, 32];
+const PAD_DIVISOR: u32 = 32;
 
 #[derive(Debug, Clone)]
 pub struct Detection {
     /// Absolute pixel coordinates in the source image.
     pub bbox: [f32; 4],
+    /// Image-left eye, image-right eye, nose, image-left mouth corner,
+    /// image-right mouth corner.
     pub landmarks: [(f32, f32); 5],
     pub score: f32,
 }
@@ -27,32 +32,17 @@ pub struct Detection {
 pub struct Detector {
     session: Session,
     input_name: String,
-    input_size: (u32, u32),
+    /// Longest side of the detector input. Smaller images are not upscaled.
+    max_side: u32,
     score_threshold: f32,
     iou_threshold: f32,
-    levels: Vec<Level>,
-}
-
-struct Level {
-    stride: usize,
-    score_name: String,
-    bbox_name: String,
-    kps_name: String,
-    anchors: Vec<(f32, f32)>,
-}
-
-struct Preprocess {
-    scale_x: f32,
-    scale_y: f32,
-    offset_x: f32,
-    offset_y: f32,
 }
 
 impl Detector {
     pub fn load(
         path: &Path,
         environment: &Environment,
-        input_size: (u32, u32),
+        max_side: u32,
         score_threshold: f32,
         iou_threshold: f32,
     ) -> Result<Self, String> {
@@ -66,64 +56,26 @@ impl Detector {
             .map_err(|error| format!("failed to load detector {}: {error}", path.display()))?;
         let input_name = session.inputs()[0].name().to_string();
 
-        let mut levels = Vec::with_capacity(STRIDES.len());
         for stride in STRIDES {
-            let score_name = format!("score_{stride}");
-            let bbox_name = format!("bbox_{stride}");
-            let kps_name = format!("kps_{stride}");
-            let score = session
-                .outputs()
-                .iter()
-                .find(|output| output.name() == score_name)
-                .ok_or_else(|| format!("model is missing {score_name}"))?;
-            if !session
-                .outputs()
-                .iter()
-                .any(|output| output.name() == bbox_name)
-            {
-                return Err(format!("model is missing {bbox_name}"));
+            for prefix in ["cls", "obj", "bbox", "kps"] {
+                let name = format!("{prefix}_{stride}");
+                if !session.outputs().iter().any(|output| output.name() == name) {
+                    return Err(format!("model is missing {name}"));
+                }
             }
-            if !session
-                .outputs()
-                .iter()
-                .any(|output| output.name() == kps_name)
-            {
-                return Err(format!("model is missing {kps_name}"));
-            }
-            let shape = score
-                .dtype()
-                .tensor_shape()
-                .ok_or_else(|| format!("{score_name} has no static shape"))?;
-            let total = if shape.len() >= 2 {
-                shape[shape.len() - 2]
-            } else {
-                return Err(format!("{score_name} has an unexpected shape {shape:?}"));
-            };
-            if total <= 0 {
-                return Err(format!("{score_name} has no anchors: {shape:?}"));
-            }
-            let anchors = generate_anchors(input_size, stride, total as usize)?;
-            levels.push(Level {
-                stride,
-                score_name,
-                bbox_name,
-                kps_name,
-                anchors,
-            });
         }
 
         Ok(Self {
             session,
             input_name,
-            input_size,
+            max_side: max_side.max(PAD_DIVISOR),
             score_threshold,
             iou_threshold,
-            levels,
         })
     }
 
     pub fn detect(&mut self, image: &RgbImage) -> Result<Vec<Detection>, String> {
-        let (input_image, preprocess) = self.preprocess(image)?;
+        let (input_image, scale) = prepare(image, self.max_side)?;
         let input = Self::input_tensor(&input_image)?;
         let value = Value::from_array(input).map_err(|error| error.to_string())?;
         let outputs = self
@@ -131,96 +83,42 @@ impl Detector {
             .run(ort::inputs![&self.input_name => value])
             .map_err(|error| format!("detector inference failed: {error}"))?;
 
+        let (padded_width, padded_height) = input_image.dimensions();
         let mut candidates = Vec::new();
-        for level in &self.levels {
-            let anchors = level.anchors.len();
-            let scores = output_values(&outputs, &level.score_name, anchors)?;
-            let bboxes = output_values(&outputs, &level.bbox_name, anchors * 4)?;
-            let keypoints = output_values(&outputs, &level.kps_name, anchors * 10)?;
-            let stride = level.stride as f32;
+        for stride in STRIDES {
+            let columns = padded_width as usize / stride;
+            let rows = padded_height as usize / stride;
+            let cells = rows * columns;
+            let scores = output_values(&outputs, &format!("cls_{stride}"), cells)?;
+            let objects = output_values(&outputs, &format!("obj_{stride}"), cells)?;
+            let bboxes = output_values(&outputs, &format!("bbox_{stride}"), cells * 4)?;
+            let keypoints = output_values(&outputs, &format!("kps_{stride}"), cells * 10)?;
 
-            for (index, &(anchor_x, anchor_y)) in level.anchors.iter().enumerate() {
-                let score = scores[index];
-                if score < self.score_threshold {
-                    continue;
+            for row in 0..rows {
+                for column in 0..columns {
+                    let index = row * columns + column;
+                    let class_score = scores[index].clamp(0.0, 1.0);
+                    let object_score = objects[index].clamp(0.0, 1.0);
+                    let score = (class_score * object_score).sqrt();
+                    if score < self.score_threshold {
+                        continue;
+                    }
+                    if let Some(detection) = decode_cell(
+                        stride,
+                        row,
+                        column,
+                        &bboxes[index * 4..index * 4 + 4],
+                        &keypoints[index * 10..index * 10 + 10],
+                        score,
+                        scale,
+                    ) {
+                        candidates.push(detection);
+                    }
                 }
-                let bbox = &bboxes[index * 4..index * 4 + 4];
-                let x1 = decode(
-                    -bbox[0],
-                    anchor_x,
-                    stride,
-                    preprocess.offset_x,
-                    preprocess.scale_x,
-                );
-                let y1 = decode(
-                    -bbox[1],
-                    anchor_y,
-                    stride,
-                    preprocess.offset_y,
-                    preprocess.scale_y,
-                );
-                let x2 = decode(
-                    bbox[2],
-                    anchor_x,
-                    stride,
-                    preprocess.offset_x,
-                    preprocess.scale_x,
-                );
-                let y2 = decode(
-                    bbox[3],
-                    anchor_y,
-                    stride,
-                    preprocess.offset_y,
-                    preprocess.scale_y,
-                );
-
-                let mut landmarks = [(0.0f32, 0.0f32); 5];
-                for (point, landmark) in landmarks.iter_mut().enumerate() {
-                    let offset = index * 10 + point * 2;
-                    landmark.0 = (anchor_x + keypoints[offset] * stride - preprocess.offset_x)
-                        / preprocess.scale_x;
-                    landmark.1 = (anchor_y + keypoints[offset + 1] * stride - preprocess.offset_y)
-                        / preprocess.scale_y;
-                }
-                candidates.push(Detection {
-                    bbox: [x1, y1, x2, y2],
-                    landmarks,
-                    score,
-                });
             }
         }
 
         Ok(non_maximum_suppression(candidates, self.iou_threshold))
-    }
-
-    fn preprocess(&self, image: &RgbImage) -> Result<(RgbImage, Preprocess), String> {
-        let (width, height) = image.dimensions();
-        if width == 0 || height == 0 {
-            return Err("cannot detect on an empty image".to_string());
-        }
-        let (input_width, input_height) = self.input_size;
-        let ratio = (input_width as f32 / width as f32).min(input_height as f32 / height as f32);
-        let resized_width = ((width as f32 * ratio).round() as u32).max(1);
-        let resized_height = ((height as f32 * ratio).round() as u32).max(1);
-        let resized = imageops::resize(
-            image,
-            resized_width,
-            resized_height,
-            imageops::FilterType::CatmullRom,
-        );
-        let offset_x = (input_width - resized_width) as f32 / 2.0;
-        let offset_y = (input_height - resized_height) as f32 / 2.0;
-        let mut padded = RgbImage::new(input_width, input_height);
-        imageops::overlay(&mut padded, &resized, offset_x as i64, offset_y as i64);
-        Ok((
-            padded,
-            Preprocess {
-                scale_x: resized_width as f32 / width as f32,
-                scale_y: resized_height as f32 / height as f32,
-                offset_x,
-                offset_y,
-            },
-        ))
     }
 
     fn input_tensor(image: &RgbImage) -> Result<Array4<f32>, String> {
@@ -232,34 +130,84 @@ impl Detector {
             .ok_or_else(|| "failed to access detector input tensor".to_string())?;
         let plane = width * height;
         for (index, [r, g, b]) in image.as_raw().as_chunks::<3>().0.iter().enumerate() {
-            data[index] = (f32::from(*r) - 127.5) / 128.0;
-            data[plane + index] = (f32::from(*g) - 127.5) / 128.0;
-            data[2 * plane + index] = (f32::from(*b) - 127.5) / 128.0;
+            // OpenCV builds the YuNet blob without swapRB: raw BGR in 0..255.
+            data[index] = f32::from(*b);
+            data[plane + index] = f32::from(*g);
+            data[2 * plane + index] = f32::from(*r);
         }
         Ok(input)
     }
 }
 
-fn generate_anchors(
-    input_size: (u32, u32),
+/// Resize to at most `max_side` and pad right/bottom with zeros to a multiple
+/// of 32. Returns the prepared image and the resize scale (1.0 = no resize).
+fn prepare(image: &RgbImage, max_side: u32) -> Result<(RgbImage, f32), String> {
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Err("cannot detect on an empty image".to_string());
+    }
+    let ratio = (max_side as f32 / width.max(height) as f32).min(1.0);
+    let resized_width = ((width as f32 * ratio).round() as u32).max(1);
+    let resized_height = ((height as f32 * ratio).round() as u32).max(1);
+    let resized = if (resized_width, resized_height) == (width, height) {
+        image.clone()
+    } else {
+        imageops::resize(
+            image,
+            resized_width,
+            resized_height,
+            imageops::FilterType::CatmullRom,
+        )
+    };
+    let padded_width = resized_width.div_ceil(PAD_DIVISOR) * PAD_DIVISOR;
+    let padded_height = resized_height.div_ceil(PAD_DIVISOR) * PAD_DIVISOR;
+    let mut padded = RgbImage::new(padded_width, padded_height);
+    imageops::overlay(&mut padded, &resized, 0, 0);
+    Ok((padded, resized_width as f32 / width as f32))
+}
+
+fn decode_cell(
     stride: usize,
-    total: usize,
-) -> Result<Vec<(f32, f32)>, String> {
-    let grid = (input_size.0 as usize / stride) * (input_size.1 as usize / stride);
-    if grid == 0 || !total.is_multiple_of(grid) {
-        return Err(format!(
-            "cannot derive anchors from {total} values and input {input_size:?} stride {stride}"
-        ));
+    row: usize,
+    column: usize,
+    bbox: &[f32],
+    keypoints: &[f32],
+    score: f32,
+    scale: f32,
+) -> Option<Detection> {
+    let stride = stride as f32;
+    let center_x = (column as f32 + bbox[0]) * stride;
+    let center_y = (row as f32 + bbox[1]) * stride;
+    let width = bbox[2].exp() * stride;
+    let height = bbox[3].exp() * stride;
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return None;
     }
-    let anchors_per_cell = total / grid;
-    let width = input_size.0 as usize / stride;
-    let mut anchors = Vec::with_capacity(total);
-    for pixel in 0..grid {
-        let x = (pixel % width) as f32 * stride as f32;
-        let y = (pixel / width) as f32 * stride as f32;
-        anchors.extend(std::iter::repeat_n((x, y), anchors_per_cell));
-    }
-    Ok(anchors)
+
+    let point = |index: usize| {
+        (
+            (keypoints[index * 2] + column as f32) * stride / scale,
+            (keypoints[index * 2 + 1] + row as f32) * stride / scale,
+        )
+    };
+    let landmarks = [
+        point(0), // eye on the image-left
+        point(1), // eye on the image-right
+        point(2), // nose tip
+        point(3), // mouth corner on the image-left
+        point(4), // mouth corner on the image-right
+    ];
+
+    Some(Detection {
+        bbox: [
+            (center_x - width / 2.0) / scale,
+            (center_y - height / 2.0) / scale,
+            (center_x + width / 2.0) / scale,
+            (center_y + height / 2.0) / scale,
+        ],
+        landmarks,
+        score,
+    })
 }
 
 fn output_values(
@@ -267,7 +215,10 @@ fn output_values(
     name: &str,
     expected: usize,
 ) -> Result<Vec<f32>, String> {
-    let array = outputs[name]
+    let value = outputs
+        .get(name)
+        .ok_or_else(|| format!("model output {name} is missing"))?;
+    let array = value
         .try_extract_array::<f32>()
         .map_err(|error| error.to_string())?;
     let values: Vec<f32> = array.iter().copied().collect();
@@ -278,10 +229,6 @@ fn output_values(
         ));
     }
     Ok(values)
-}
-
-fn decode(value: f32, anchor: f32, stride: f32, offset: f32, scale: f32) -> f32 {
-    (anchor + value * stride - offset) / scale
 }
 
 fn non_maximum_suppression(mut faces: Vec<Detection>, threshold: f32) -> Vec<Detection> {
@@ -316,14 +263,53 @@ fn iou(left: &[f32; 4], right: &[f32; 4]) -> f32 {
 mod tests {
     use super::*;
 
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+    }
+
     #[test]
-    fn anchors_cover_grid_and_repeat_per_cell() {
-        let anchors = generate_anchors((640, 640), 16, 3200).unwrap();
-        assert_eq!(anchors.len(), 3200);
-        assert_eq!(anchors[0], (0.0, 0.0));
-        assert_eq!(anchors[1], (0.0, 0.0));
-        assert_eq!(anchors[2], (16.0, 0.0));
-        assert_eq!(anchors[3199], (624.0, 624.0));
+    fn prepare_resizes_and_pads_to_divisor() {
+        let image = RgbImage::new(100, 70);
+        let (prepared, scale) = prepare(&image, 64).unwrap();
+        assert_eq!(prepared.dimensions(), (64, 64));
+        assert!((scale - 0.64).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prepare_does_not_upscale_small_images() {
+        let image = RgbImage::new(30, 20);
+        let (prepared, scale) = prepare(&image, 640).unwrap();
+        assert_eq!(prepared.dimensions(), (32, 32));
+        assert_eq!(scale, 1.0);
+    }
+
+    #[test]
+    fn decode_cell_keeps_image_left_to_right_landmark_order() {
+        let bbox = [0.25, -0.25, 0.0, 0.0];
+        let kps = [
+            0.01, 0.02, // eye on the image-left
+            0.11, 0.12, // eye on the image-right
+            0.21, 0.22, // nose
+            0.31, 0.32, // mouth corner on the image-left
+            0.41, 0.42, // mouth corner on the image-right
+        ];
+        let detection = decode_cell(8, 2, 3, &bbox, &kps, 0.9, 1.0).unwrap();
+        assert_close(detection.bbox[0], 22.0);
+        assert_close(detection.bbox[1], 10.0);
+        assert_close(detection.bbox[2], 30.0);
+        assert_close(detection.bbox[3], 18.0);
+        assert_close(detection.landmarks[0].0, 24.08);
+        assert_close(detection.landmarks[1].0, 24.88);
+        assert_close(detection.landmarks[2].0, 25.68);
+        assert_close(detection.landmarks[3].0, 26.48);
+        assert_close(detection.landmarks[4].0, 27.28);
+    }
+
+    #[test]
+    fn decode_cell_rejects_non_finite_box() {
+        let bbox = [0.0, 0.0, f32::INFINITY, 0.0];
+        let kps = [0.0; 10];
+        assert!(decode_cell(8, 0, 0, &bbox, &kps, 0.9, 1.0).is_none());
     }
 
     #[test]

@@ -1,8 +1,9 @@
-//! ArcFace embedding for an aligned 112x112 RGB face.
+//! AuraFace (ArcFace ResNet100) embedding for an aligned 112x112 RGB face.
 //!
 //! The model expects `(pixel - 127.5) / 127.5` in RGB channel order and returns
-//! an unnormalized 512-dimensional vector. We L2-normalize it so cosine
-//! similarity is a dot product.
+//! an unnormalized 512-dimensional vector. This matches InsightFace's ArcFace
+//! preprocessing, so the aligned crop from `align.rs` can be fed directly. We
+//! L2-normalize the output so cosine similarity is a dot product.
 
 use image::RgbImage;
 use ndarray::Array4;
@@ -40,21 +41,12 @@ impl Embedder {
     pub fn embedding(&mut self, image: &RgbImage) -> Result<Vec<f32>, String> {
         if image.dimensions() != (INPUT_SIZE as u32, INPUT_SIZE as u32) {
             return Err(format!(
-                "ArcFace requires a {INPUT_SIZE}x{INPUT_SIZE} input, got {}x{}",
+                "AuraFace requires a {INPUT_SIZE}x{INPUT_SIZE} input, got {}x{}",
                 image.width(),
                 image.height()
             ));
         }
-        let mut input = Array4::<f32>::zeros((1, 3, INPUT_SIZE, INPUT_SIZE));
-        let data = input
-            .as_slice_memory_order_mut()
-            .ok_or_else(|| "failed to access embedder input tensor".to_string())?;
-        let plane = INPUT_SIZE * INPUT_SIZE;
-        for (i, [r, g, b]) in image.as_raw().as_chunks::<3>().0.iter().enumerate() {
-            data[i] = (f32::from(*r) - 127.5) / 127.5;
-            data[plane + i] = (f32::from(*g) - 127.5) / 127.5;
-            data[2 * plane + i] = (f32::from(*b) - 127.5) / 127.5;
-        }
+        let input = input_tensor(image)?;
 
         let value = Value::from_array(input).map_err(|error| error.to_string())?;
         let outputs = self
@@ -67,13 +59,44 @@ impl Embedder {
         let mut embedding: Vec<f32> = output.iter().copied().collect();
         if embedding.len() != EMBEDDING_DIM {
             return Err(format!(
-                "unexpected ArcFace output length: {} (expected {EMBEDDING_DIM})",
+                "unexpected AuraFace output length: {} (expected {EMBEDDING_DIM})",
                 embedding.len()
             ));
         }
         if !crate::math::l2_normalize(&mut embedding) {
-            return Err("ArcFace produced a degenerate embedding".to_string());
+            return Err("AuraFace produced a degenerate embedding".to_string());
         }
         Ok(embedding)
+    }
+}
+
+fn input_tensor(image: &RgbImage) -> Result<Array4<f32>, String> {
+    let mut input = Array4::<f32>::zeros((1, 3, INPUT_SIZE, INPUT_SIZE));
+    let data = input
+        .as_slice_memory_order_mut()
+        .ok_or_else(|| "failed to access embedder input tensor".to_string())?;
+    let plane = INPUT_SIZE * INPUT_SIZE;
+    for (i, [r, g, b]) in image.as_raw().as_chunks::<3>().0.iter().enumerate() {
+        data[i] = (f32::from(*r) - 127.5) / 127.5;
+        data[plane + i] = (f32::from(*g) - 127.5) / 127.5;
+        data[2 * plane + i] = (f32::from(*b) - 127.5) / 127.5;
+    }
+    Ok(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Rgb;
+
+    #[test]
+    fn input_tensor_uses_rgb_order_and_arcface_normalization() {
+        let image = RgbImage::from_pixel(INPUT_SIZE as u32, INPUT_SIZE as u32, Rgb([255, 0, 128]));
+        let tensor = input_tensor(&image).unwrap();
+        let data = tensor.as_slice_memory_order().unwrap();
+        let plane = INPUT_SIZE * INPUT_SIZE;
+        assert_eq!(data[0], 1.0);
+        assert_eq!(data[plane], -1.0);
+        assert!((data[2 * plane] - (128.0 - 127.5) / 127.5).abs() < 1e-6);
     }
 }

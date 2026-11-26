@@ -4,7 +4,7 @@ Synchronous face and scene inference primitives backed by ONNX Runtime.
 
 ## Scope
 
-- Face detection, alignment, and 512-dimensional ArcFace embeddings.
+- Face detection, alignment, and 512-dimensional AuraFace/ArcFace embeddings.
 - Face quality gates (size, brightness, blur) folded into the result.
 - Passive spoof scoring and optional eye-aspect-ratio (EAR) landmarks.
 - 384-dimensional DINOv2 ViT-S/14 scene embeddings.
@@ -29,7 +29,7 @@ environment, use `FaceEngine::load_with` or `SceneEngine::load(config, &env)`.
 ```toml
 [dependencies]
 # Not published on crates.io: use a git tag, or a local checkout while developing.
-vision-inference = { git = "https://github.com/m-fadil/vision-inference.git", tag = "v0.1.0" }
+vision-inference = { git = "https://github.com/m-fadil/vision-inference.git", tag = "v0.2.0" }
 # vision-inference = { path = "/path/to/vision-inference" }
 image = "0.25"
 ```
@@ -40,9 +40,9 @@ Replace `tag` with `rev = "<sha>"` if you need an immutable pin.
 export ORT_DYLIB_PATH=/absolute/path/to/libonnxruntime.so
 ```
 
-Expected face models are an SCRFD detector, an ArcFace embedder, a MiniFASNet
-spoof model, and a PIPNet 68-point landmark model. The scene model is a
-DINOv2-small ViT-S/14 ONNX export.
+Expected face models are a YuNet detector, an AuraFace (ArcFace-compatible
+ResNet100) embedder, a MiniFASNet spoof model, and a PIPNet 68-point landmark
+model. The scene model is a DINOv2-small ViT-S/14 ONNX export.
 
 ## Usage
 
@@ -60,11 +60,11 @@ use vision_inference::scene::{SceneConfig, SceneEngine};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let faces = FaceEngine::load(FaceConfig {
-        detector_model: "models/2.5g_bnkps.onnx".into(),
-        embedder_model: "models/w600k_r50.onnx".into(),
+        detector_model: "models/face_detection_yunet_2026may.onnx".into(),
+        embedder_model: "models/glintr100.onnx".into(),
         spoof_model: "models/minifasnet_v2_128.onnx".into(),
         landmark_model: Some("models/pipnet_r18_68.onnx".into()),
-        model_version: "buffalo_l".into(),
+        model_version: "auraface-r100-v1".into(),
         detector_input_size: 640,
         detector_score_threshold: 0.5,
         detector_iou_threshold: 0.4,
@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let image = open("face.jpg")?;
     let face = faces.analyze(&image)?;
     assert_eq!(face.embedding.len(), 512);
-    // Use faces.analyze_liveness(&image)? for an additional EAR value.
+    // Use faces.analyze_liveness(&image)? for left/right EAR and face geometry.
 
     let scenes = SceneEngine::load_standalone(SceneConfig {
         model: "models/dinov2_vits14.onnx".into(),
