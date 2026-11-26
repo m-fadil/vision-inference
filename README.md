@@ -28,8 +28,8 @@ environment, use `FaceEngine::load_with` or `SceneEngine::load(config, &env)`.
 
 ```toml
 [dependencies]
-# Not published on crates.io: use a git tag, or a local checkout while developing.
-vision-inference = { git = "https://github.com/m-fadil/vision-inference.git", tag = "v0.2.0" }
+# Not published on crates.io: point the git URL at your mirror, or use a local checkout.
+vision-inference = { git = "https://example.com/vision-inference.git", tag = "v0.2.0" }
 # vision-inference = { path = "/path/to/vision-inference" }
 image = "0.25"
 ```
